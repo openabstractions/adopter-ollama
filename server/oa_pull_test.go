@@ -382,6 +382,52 @@ func TestOAPullCorruptSourceFailsTypedThenRetriesAttempt(t *testing.T) {
 	}
 }
 
+// A completed service operation whose result bytes are gone reaches a typed
+// terminal state, and the next pull retries as the next attempt [JOB-A10].
+func TestOAPullLostServiceResultRetriesNextAttempt(t *testing.T) {
+	home := setupOA(t)
+	t.Setenv(oaDownloadEnv, "service")
+	r := newOARegistry(t)
+	f := oaService(t, home, true)
+	pullOK(t, r)
+	assertBlob(t, r.layerDigest, r.layer)
+
+	// Remove Ollama's committed blob and the service's result for the layer.
+	fp, err := manifest.BlobsPath(r.layerDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fp); err != nil {
+		t.Fatal(err)
+	}
+	var removed int
+	for _, op := range f.operations(t) {
+		if strings.Contains(string(op.Spec), r.layerDigest) {
+			if err := os.Remove(filepath.Join(f.options.JobRoot, "results", op.ID)); err == nil {
+				removed++
+			}
+		}
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d layer results", removed)
+	}
+
+	typed := oaReason(t, pullOA(t.Context(), r, nil, nil), oaReasonResultUnavailable)
+	if typed.Cause != "result_lost" {
+		t.Fatalf("lost result: %+v", typed)
+	}
+	dir, _ := oaRequestsDir()
+	record, err := oaLoadRecord(oaRecordPath(dir, r.layerDigest))
+	if err != nil || record == nil || !record.Terminal || record.Identity.Attempt != 0 {
+		t.Fatalf("terminal record after loss: %+v %v", record, err)
+	}
+	pullOK(t, r)
+	assertBlob(t, r.layerDigest, r.layer)
+	if gets := r.layerGets.Load(); gets != 2 {
+		t.Fatalf("layer transfers: %d (want original and retry)", gets)
+	}
+}
+
 // A blob the registry does not have ends typed as not_found, with no retry loop.
 func TestOAPullMissingBlobIsTyped(t *testing.T) {
 	home := setupOA(t)

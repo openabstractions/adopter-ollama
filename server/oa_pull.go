@@ -311,6 +311,10 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 			}
 			return fail(&OAError{Reason: oaReasonUnknown, Detail: "observe work", Err: err})
 		}
+		if observed.Outcome == "unavailable" {
+			// A policy decision outage reads nothing; the record is kept [JOB-A9].
+			return fail(&OAError{Reason: oaReasonUnavailable, Detail: "observe work: policy decision unavailable"})
+		}
 		if observed.Outcome != "observed" {
 			return fail(&OAError{Reason: oaReasonUnknown, Detail: "observe work outcome " + observed.Outcome})
 		}
@@ -359,8 +363,18 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 		}
 		var service *acceptance.ServiceError
 		if errors.As(err, &service) && service.Code != "invalid_result" {
-			// Complete work whose bytes are gone is not retryable under JOB-A7.
-			return fail(&OAError{Reason: oaReasonResultUnavailable, Err: err})
+			typed := &OAError{Reason: oaReasonResultUnavailable, Err: err}
+			// A recorded loss ends the operation as failed/result_lost, and the
+			// next pull presents the next attempt of the key [JOB-A10, JOB-A7].
+			if again, oerr := jobs.ObserveWork(ctx, id); oerr == nil && again.Outcome == "observed" &&
+				again.Snapshot.State == "failed" && again.Snapshot.Failure != nil {
+				typed.Cause = again.Snapshot.Failure.Cause
+				record.Terminal = true
+				if saveErr := oaSaveRecord(recordPath, record); saveErr != nil {
+					return false, saveErr
+				}
+			}
+			return fail(typed)
 		}
 		return false, err
 	}
