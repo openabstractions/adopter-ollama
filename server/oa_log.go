@@ -28,8 +28,8 @@ const (
 	oaLogReasonQueueFull            = "queue_full"
 )
 
-// oaLogWriteTimeout bounds one record's delivery, so an unresponsive service
-// costs a log call at most this long.
+// oaLogWriteTimeout bounds one record's delivery to the service and Serve's
+// drain of the queue on exit.
 var oaLogWriteTimeout = 2 * time.Second
 
 // OALogError is the typed, visible failure of the OA logging seam.
@@ -78,11 +78,12 @@ func oaLogHandler(ctx context.Context, local slog.Handler, level slog.Level) (sl
 		return local, &OALogError{Reason: oaLogReasonUnavailable, Detail: "abstraction.logging/sink@1 did not resolve", Err: err}
 	}
 	report := &oaLogReporter{local: local}
-	queue := oalog.NewAsyncSink(oaTimeoutSink{inner: oaLogInner(sink)}, oalog.AsyncOptions{
-		Capacity:   oaLogQueueCapacity,
-		OnOverflow: report.overflow,
-		OnFailure:  report.failure,
-		OnRecovery: report.recovery,
+	queue := oalog.NewAsyncSink(oaLogInner(sink), oalog.AsyncOptions{
+		Capacity:     oaLogQueueCapacity,
+		WriteTimeout: oaLogWriteTimeout,
+		OnOverflow:   report.overflow,
+		OnFailure:    report.failure,
+		OnRecovery:   report.recovery,
 	})
 	// oalog.Level equals slog.Level, so the configured level converts by cast.
 	remote := oalog.NewHandler(queue, &oalog.Options{Program: "ollama", Level: oalog.Level(level)})
@@ -97,24 +98,6 @@ var oaLogQueueCapacity = 1024
 
 // oaLogInner builds the delivering sink; tests replace it to stall delivery.
 var oaLogInner = oalog.NewClientSink
-
-// oaTimeoutSink bounds each delivery by oaLogWriteTimeout. The asynchronous
-// sink delivers without a deadline of its own, and an unresponsive service
-// would otherwise hold its one worker until Close.
-type oaTimeoutSink struct{ inner oalog.Sink }
-
-func (s oaTimeoutSink) Write(r oalog.Record) error { return s.WriteContext(context.Background(), r) }
-
-func (s oaTimeoutSink) WriteContext(ctx context.Context, r oalog.Record) error {
-	ctx, cancel := context.WithTimeout(ctx, oaLogWriteTimeout)
-	defer cancel()
-	if w, ok := s.inner.(interface {
-		WriteContext(context.Context, oalog.Record) error
-	}); ok {
-		return w.WriteContext(ctx, r)
-	}
-	return s.inner.Write(r)
-}
 
 // oaLogReporter reports each transition of the asynchronous sink on the local
 // handler only, so a report cannot recurse into the service. Failure and
@@ -187,8 +170,7 @@ func (h *oaFanout) WithGroup(name string) slog.Handler {
 // close drains the queue for up to the deadline and reports records that did
 // not reach the service.
 func (h *oaFanout) close(ctx context.Context) {
-	err := h.queue.Close(ctx)
-	c := h.queue.Counts()
+	c, err := h.queue.Close(ctx)
 	if err != nil || c.Failed+c.Dropped+c.Abandoned > 0 {
 		attrs := []slog.Attr{slog.Uint64("written", c.Written), slog.Uint64("failed", c.Failed), slog.Uint64("dropped", c.Dropped), slog.Uint64("abandoned", c.Abandoned)}
 		if err != nil {

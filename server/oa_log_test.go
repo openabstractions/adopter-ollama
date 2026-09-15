@@ -244,12 +244,12 @@ func TestOALoggingWriteFailureIsReportedOnce(t *testing.T) {
 	fixture := oaLogService(t, home)
 	buf := &lockedBuffer{}
 	local := logutil.NewLogger(buf, slog.LevelInfo)
+	oaLogWriteTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { oaLogWriteTimeout = 2 * time.Second })
 	handler, err := oaLogHandler(t.Context(), local.Handler(), slog.LevelInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oaLogWriteTimeout = 500 * time.Millisecond
-	t.Cleanup(func() { oaLogWriteTimeout = 2 * time.Second })
 	logger := slog.New(handler)
 	logger.Info("before the service stops")
 	oaLogSettled(t, handler, func(c oalog.AsyncCounts) bool { return c.Written == 1 })
@@ -358,7 +358,10 @@ func TestOALoggingUnresponsiveServiceTimesOutAndIsReported(t *testing.T) {
 	logger.Info("never answered 2")
 	c := oaLogSettled(t, handler, func(c oalog.AsyncCounts) bool { return c.Failed == 2 })
 	oaLogWaitFor(t, buf, "reason=write_failed")
-	if strings.Count(buf.String(), "OpenAbstractions logging write failed") != 1 || !strings.Contains(buf.String(), "context deadline exceeded") || c.Written != 0 {
+	// The bounded delivery reports either its own timeout or the cancelled
+	// delivery's context error, whichever it observes first.
+	timedOut := strings.Contains(buf.String(), oalog.ErrWriteTimeout.Error()) || strings.Contains(buf.String(), "context deadline exceeded")
+	if strings.Count(buf.String(), "OpenAbstractions logging write failed") != 1 || !timedOut || c.Written != 0 {
 		t.Fatalf("unresponsive service %+v:\n%s", c, buf.String())
 	}
 }
