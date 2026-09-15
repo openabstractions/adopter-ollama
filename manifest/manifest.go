@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -157,15 +158,6 @@ func WriteManifest(name model.Name, config Layer, layers []Layer) error {
 	}
 
 	p := filepath.Join(manifests, name.Filepath())
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(p)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 
 	m := Manifest{
 		SchemaVersion: 2,
@@ -174,7 +166,11 @@ func WriteManifest(name model.Name, config Layer, layers []Layer) error {
 		Layers:        layers,
 	}
 
-	return json.NewEncoder(f).Encode(m)
+	var b bytes.Buffer
+	if err := json.NewEncoder(&b).Encode(m); err != nil {
+		return err
+	}
+	return WriteFile(p, b.Bytes())
 }
 
 func Manifests(continueOnError bool) (map[model.Name]*Manifest, error) {

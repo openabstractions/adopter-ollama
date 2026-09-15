@@ -1113,7 +1113,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return err
 	}
 
-	err = os.WriteFile(fp, manifestData, 0o644)
+	err = manifest.WriteFile(fp, manifestData)
 	if err != nil {
 		slog.Info(fmt.Sprintf("couldn't write to %s", fp))
 		return err
@@ -1211,7 +1211,7 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 		return err
 	}
 
-	if err := os.WriteFile(fp, manifestData, 0o644); err != nil {
+	if err := manifest.WriteFile(fp, manifestData); err != nil {
 		return err
 	}
 
