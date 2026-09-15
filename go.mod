@@ -16,7 +16,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/x448/float16 v0.8.4
 	golang.org/x/sync v0.17.0
-	golang.org/x/sys v0.37.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
@@ -29,6 +29,10 @@ require (
 	github.com/klauspost/compress v1.18.3
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/nlpodyssey/gopickle v0.3.0
+	github.com/openabstractions/abstraction-download/go v0.4.3
+	github.com/openabstractions/abstraction-facade/go v0.4.1-0.20260913093140-c28860ec592f
+	github.com/openabstractions/abstraction-identity v0.2.1-0.20260913090829-6916ad75b439
+	github.com/openabstractions/abstraction-job/go v0.4.3-0.20260913090942-06eddccb1ffe
 	github.com/pdevine/tensor v0.0.0-20240510204454-f88f4562727c
 	github.com/pelletier/go-toml/v2 v2.2.2
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
@@ -67,6 +71,16 @@ require (
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
+	github.com/openabstractions/abstraction-asks/go v0.3.1-0.20260913091006-9741a4da352c // indirect
+	github.com/openabstractions/abstraction-cas/go v0.3.1-0.20260913090841-c64b42cc8460 // indirect
+	github.com/openabstractions/abstraction-config/go v0.3.1-0.20260913090930-b42c90e2f37f // indirect
+	github.com/openabstractions/abstraction-facade/go-core v0.1.0 // indirect
+	github.com/openabstractions/abstraction-logging/go v0.3.1-0.20260913090953-7ad613b53500 // indirect
+	github.com/openabstractions/abstraction-model/go v0.3.1-0.20260913091047-7c807a66e986 // indirect
+	github.com/openabstractions/abstraction-rights/go v0.2.1-0.20260913091032-3fbc1221f2e4 // indirect
+	github.com/openabstractions/abstraction-router/go v0.0.0-20260913091059-5eaf7cd4cd1c // indirect
+	github.com/openabstractions/abstraction-storage/go v0.2.1-0.20260913090905-d7092ee93ef9 // indirect
+	github.com/openabstractions/abstraction-watch/go v0.2.1-0.20260913090853-0286faef3daa // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect

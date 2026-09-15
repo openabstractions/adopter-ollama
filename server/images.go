@@ -1030,6 +1030,9 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
 	if hasTensorLayers(mf.Layers) {
+		if err := oaCheckTransfer(); err != nil {
+			return err
+		}
 		if err := mlx.CheckInit(); err != nil {
 			slog.Debug("MLX is unavailable for safetensors model pull", "error", err)
 			return errors.New("this model requires MLX support, but the MLX runtime is not available")
@@ -1053,7 +1056,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 
 	skipVerify := make(map[string]bool)
 	for _, layer := range layers {
-		cacheHit, err := downloadBlob(ctx, downloadOpts{
+		cacheHit, err := pullBlob(ctx, layer.Size, downloadOpts{
 			n:       n,
 			digest:  layer.Digest,
 			regOpts: regOpts,
