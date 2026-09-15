@@ -17,8 +17,6 @@ import (
 
 	oaclient "github.com/openabstractions/abstraction-facade/go/client"
 	oalog "github.com/openabstractions/abstraction-logging/go"
-	oalogwire "github.com/openabstractions/abstraction-logging/go/abstraction/logging"
-	oalogclient "github.com/openabstractions/abstraction-logging/go/client"
 )
 
 const oaLogEnv = "OLLAMA_OA_LOGGING"
@@ -80,28 +78,9 @@ func oaLogHandler(ctx context.Context, local slog.Handler, level slog.Level) (sl
 		return local, &OALogError{Reason: oaLogReasonUnavailable, Detail: "abstraction.logging/sink@1 did not resolve", Err: err}
 	}
 	state := &oaLogState{warn: local}
-	remote := oalog.NewHandler(oaLogSink{client: sink}, &oalog.Options{Program: "ollama", Level: oalog.Level(level)})
+	// oalog.Level equals slog.Level, so the configured level converts by cast.
+	remote := oalog.NewClientHandler(sink, &oalog.Options{Program: "ollama", Level: oalog.Level(level)})
 	return &oaFanout{local: local, remote: remote, state: state}, nil
-}
-
-// oaLogSink adapts the resolved sink client to the provider Sink the Go slog
-// handler writes. The record crosses as its contract encoding.
-type oaLogSink struct{ client *oalogclient.Client }
-
-func (s oaLogSink) Write(r oalog.Record) error { return s.WriteContext(context.Background(), r) }
-
-func (s oaLogSink) WriteContext(ctx context.Context, r oalog.Record) error {
-	encoded, err := r.Encode()
-	if err != nil {
-		return err
-	}
-	record, err := oalogwire.Decode(encoded)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, oaLogWriteTimeout)
-	defer cancel()
-	return s.client.WriteContext(ctx, *record)
 }
 
 // oaLogState counts deliveries and reports each transition into and out of
@@ -174,7 +153,10 @@ func (h *oaFanout) Handle(ctx context.Context, r slog.Record) error {
 		err = h.local.Handle(ctx, r.Clone())
 	}
 	if h.remote.Enabled(ctx, r.Level) {
-		if remoteErr := h.remote.Handle(ctx, r); remoteErr != nil {
+		remoteCtx, cancel := context.WithTimeout(ctx, oaLogWriteTimeout)
+		remoteErr := h.remote.Handle(remoteCtx, r)
+		cancel()
+		if remoteErr != nil {
 			h.state.failure(ctx, remoteErr)
 		} else {
 			h.state.delivered(ctx)
