@@ -1955,6 +1955,7 @@ func Serve(ln net.Listener) error {
 	if err := oaServeLogger(logutil.NewLogger(os.Stderr, envconfig.LogLevel()), envconfig.LogLevel()); err != nil {
 		return err
 	}
+	defer oaLogShutdown()
 	slog.Info("server config", "env", envconfig.Values())
 	cloudDisabled, _ := internalcloud.Status()
 	slog.Info(fmt.Sprintf("Ollama cloud disabled: %t", cloudDisabled))
