@@ -1952,7 +1952,9 @@ func (s *Server) ModelRecommendationsExperimentalHandler(c *gin.Context) {
 }
 
 func Serve(ln net.Listener) error {
-	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
+	if err := oaServeLogger(logutil.NewLogger(os.Stderr, envconfig.LogLevel()), envconfig.LogLevel()); err != nil {
+		return err
+	}
 	slog.Info("server config", "env", envconfig.Values())
 	cloudDisabled, _ := internalcloud.Status()
 	slog.Info(fmt.Sprintf("Ollama cloud disabled: %t", cloudDisabled))
