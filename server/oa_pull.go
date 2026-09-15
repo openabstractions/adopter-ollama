@@ -227,6 +227,20 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
+	// Storage is asked only before the first submission. A recorded request
+	// belongs to an operation already accepted, which is restored and observed.
+	if dir, err := oaRequestsDir(); err != nil {
+		return false, err
+	} else if _, err := os.Stat(oaRecordPath(dir, digest)); errors.Is(err, os.ErrNotExist) {
+		reused, err := oaReuseFromStorage(ctx, digest, size, fp, opts.fn)
+		if reused {
+			return true, nil
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		oaReportStorage(digest, err)
+	}
 	// Registry credentials cannot travel in the portable download request.
 	if r := opts.regOpts; r != nil && (r.Token != "" || r.Username != "" || r.Password != "") {
 		return fail(&OAError{Reason: oaReasonCredentialsRequired, Detail: "this registry pull needs credentials and abstraction.download requests are anonymous"})

@@ -31,21 +31,22 @@ import (
 // oaRegistry is a local registry serving one GGUF layer and one config blob.
 // Like the public registry, blob URLs redirect to a separate content host.
 type oaRegistry struct {
-	server      *httptest.Server
-	cdn         string
-	name        string
-	layer       []byte
-	layerDigest string
-	config      []byte
-	configDig   string
-	layerGets   atomic.Int32 // layer byte transfers from any client
-	blobHeads   atomic.Int32
-	ollamaGets  atomic.Int32 // registry blob requests from Ollama's own downloader
-	started     chan struct{}
-	startOnce   sync.Once
-	release     chan struct{} // nil serves immediately
-	corrupt     atomic.Bool
-	missing     atomic.Bool
+	server       *httptest.Server
+	cdn          string
+	name         string
+	layer        []byte
+	layerDigest  string
+	config       []byte
+	configDig    string
+	layerGets    atomic.Int32 // layer byte transfers from any client
+	blobHeads    atomic.Int32
+	ollamaGets   atomic.Int32 // registry blob requests from Ollama's own downloader
+	blobRequests atomic.Int32 // every blob request, registry or CDN, from any client
+	started      chan struct{}
+	startOnce    sync.Once
+	release      chan struct{} // nil serves immediately
+	corrupt      atomic.Bool
+	missing      atomic.Bool
 }
 
 func newOARegistry(t *testing.T) *oaRegistry {
@@ -70,6 +71,9 @@ func newOARegistry(t *testing.T) *oaRegistry {
 }
 
 func (r *oaRegistry) serve(w http.ResponseWriter, req *http.Request) {
+	if strings.Contains(req.URL.Path, "/blobs/") || strings.HasPrefix(req.URL.Path, "/cdn/") {
+		r.blobRequests.Add(1)
+	}
 	switch {
 	case strings.Contains(req.URL.Path, "/manifests/"):
 		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
