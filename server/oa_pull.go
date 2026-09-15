@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -25,15 +24,18 @@ import (
 	"github.com/ollama/ollama/manifest"
 	request "github.com/openabstractions/abstraction-download/go/abstraction/download/request"
 	oaclient "github.com/openabstractions/abstraction-facade/go/client"
+	"github.com/openabstractions/abstraction-identity/listen"
 	acceptance "github.com/openabstractions/abstraction-job/go/abstraction/job/acceptance"
 )
 
 const oaDownloadEnv = "OLLAMA_OA_DOWNLOAD"
 
 // OAError is the typed, visible failure of the OA download seam. Reason is one
-// of the oaReason* words; Detail carries the service's own reason text.
+// of the oaReason* words, Cause the service's typed failure cause when it
+// reported one, and Detail the service's own reason text.
 type OAError struct {
 	Reason string
+	Cause  string
 	Digest string
 	Detail string
 	Err    error
@@ -42,10 +44,12 @@ type OAError struct {
 const (
 	oaReasonInvalidConfiguration = "invalid_configuration"
 	oaReasonUnavailable          = "unavailable"
+	oaReasonUntrusted            = "untrusted"
 	oaReasonUnknown              = "unknown"
 	oaReasonRefused              = "refused"
 	oaReasonProviderChanged      = "provider_changed"
 	oaReasonCredentialsRequired  = "credentials_required"
+	oaReasonNotFound             = "not_found"
 	oaReasonUnsupported          = "unsupported"
 	oaReasonFailed               = "failed"
 	oaReasonResultUnavailable    = "result_unavailable"
@@ -59,6 +63,9 @@ func (e *OAError) Error() string {
 		b.WriteString(" " + e.Digest)
 	}
 	b.WriteString(": " + e.Reason)
+	if e.Cause != "" && e.Cause != e.Reason {
+		b.WriteString(" (" + e.Cause + ")")
+	}
 	if e.Detail != "" {
 		b.WriteString(": " + e.Detail)
 	}
@@ -109,26 +116,22 @@ func pullBlob(ctx context.Context, size int64, opts downloadOpts) (bool, error) 
 	return oaDownloadBlob(ctx, size, opts)
 }
 
-// oaRecord is the caller recovery record, persisted before Submit.
+// oaRecord is the caller recovery record, persisted before Submit. Binding is
+// the resolved selection RestoreJobs authenticates again after a restart.
+// Terminal marks an identity whose operation failed, was cancelled or was
+// sealed; the next pull submits the next attempt of the same key [JOB-A7].
 type oaRecord struct {
-	Format       string   `json:"format"`
-	Digest       string   `json:"digest"`
-	Attempt      int      `json:"attempt"`
-	Endpoint     string   `json:"endpoint"`
-	LogicalOwner string   `json:"logical_owner"`
-	Key          string   `json:"key"`
-	HistoryEpoch string   `json:"history_epoch"`
-	Kind         string   `json:"kind"`
-	Request      []byte   `json:"request"`
-	Guarantees   []string `json:"required_guarantees"`
-	OperationID  string   `json:"operation_id,omitempty"`
+	Format      string                     `json:"format"`
+	Digest      string                     `json:"digest"`
+	Binding     oaclient.JobsBinding       `json:"binding"`
+	Identity    acceptance.RequestIdentity `json:"identity"`
+	Kind        string                     `json:"kind"`
+	Request     []byte                     `json:"request"`
+	OperationID string                     `json:"operation_id,omitempty"`
+	Terminal    bool                       `json:"terminal,omitempty"`
 }
 
-const oaRecordFormat = "ollama-oa-download/1"
-
-func (r *oaRecord) identity() acceptance.RequestIdentity {
-	return acceptance.RequestIdentity{Key: r.Key, HistoryEpoch: r.HistoryEpoch}
-}
+const oaRecordFormat = "ollama-oa-download/2"
 
 // oaRequestsDir sits beside blobs/ so PruneLayers never removes records.
 func oaRequestsDir() (string, error) {
@@ -148,16 +151,10 @@ func oaLoadRecord(path string) (*oaRecord, error) {
 		return nil, err
 	}
 	var r oaRecord
-	// A record without an endpoint only names the next attempt after terminal work.
-	if err := json.Unmarshal(data, &r); err != nil || r.Format != oaRecordFormat || r.Attempt < 0 || r.Endpoint != "" && (r.Key == "" || r.HistoryEpoch == "") {
+	if err := json.Unmarshal(data, &r); err != nil || r.Format != oaRecordFormat || r.Identity.Key == "" || r.Identity.HistoryEpoch == "" || r.Identity.Attempt < 0 || r.Binding.Endpoint == "" || r.Binding.LogicalOwner == "" {
 		return nil, fmt.Errorf("unreadable OA request record %s: %v", path, err)
 	}
 	return &r, nil
-}
-
-// oaNextAttempt retires a terminal identity so the next pull submits a new one.
-func oaNextAttempt(path string, r *oaRecord) error {
-	return oaSaveRecord(path, &oaRecord{Format: oaRecordFormat, Digest: r.Digest, Attempt: r.Attempt + 1})
 }
 
 func oaSaveRecord(path string, r *oaRecord) error {
@@ -172,18 +169,50 @@ func oaSaveRecord(path string, r *oaRecord) error {
 	return os.Rename(tmp, path)
 }
 
-func oaKey(digest string, attempt int) string {
-	key := "ollama-blob-" + strings.ReplaceAll(digest, ":", "-")
-	if attempt > 0 {
-		key += fmt.Sprintf("-attempt-%d", attempt)
+func oaKey(digest string) string {
+	return "ollama-blob-" + strings.ReplaceAll(digest, ":", "-")
+}
+
+// oaBindError types a resolution or restoration failure.
+func oaBindError(detail string, err error) error {
+	var service *acceptance.ServiceError
+	switch {
+	case errors.Is(err, listen.ErrServerUntrusted):
+		return &OAError{Reason: oaReasonUntrusted, Detail: detail, Err: err}
+	case errors.As(err, &service) && service.Code == "invalid_acceptance":
+		return &OAError{Reason: oaReasonProviderChanged, Detail: detail, Err: err}
+	default:
+		return &OAError{Reason: oaReasonUnavailable, Detail: detail, Err: err}
 	}
-	return key
+}
+
+// oaFailure types terminal work by the service's cause [JOB-A8].
+func oaFailure(s *acceptance.OperationSnapshot) *OAError {
+	e := &OAError{Reason: oaReasonFailed, Detail: s.State}
+	if s.Failure == nil {
+		return e
+	}
+	e.Cause = s.Failure.Cause
+	e.Detail = s.State + " (" + s.Failure.Classification + "): " + s.Failure.Message
+	switch s.Failure.Cause {
+	case acceptance.FailureCauseUnauthorized:
+		e.Reason = oaReasonCredentialsRequired
+	case acceptance.FailureCauseNotFound:
+		e.Reason = oaReasonNotFound
+	case acceptance.FailureCauseDigestMismatch:
+		e.Reason, e.Err = oaReasonDigestMismatch, errDigestMismatch
+	}
+	return e
 }
 
 func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, error) {
 	digest := opts.digest
-	fail := func(reason, detail string, err error) (bool, error) {
-		return false, &OAError{Reason: reason, Digest: digest, Detail: detail, Err: err}
+	fail := func(err error) (bool, error) {
+		var typed *OAError
+		if errors.As(err, &typed) && typed.Digest == "" {
+			typed.Digest = digest
+		}
+		return false, err
 	}
 	if digest == "" {
 		return false, fmt.Errorf("%s: %s", opts.n.DisplayNamespaceModel(), "digest is empty")
@@ -200,17 +229,8 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 	}
 	// Registry credentials cannot travel in the portable download request.
 	if r := opts.regOpts; r != nil && (r.Token != "" || r.Username != "" || r.Password != "") {
-		return fail(oaReasonCredentialsRequired, "this registry pull needs credentials and abstraction.download requests are anonymous", nil)
+		return fail(&OAError{Reason: oaReasonCredentialsRequired, Detail: "this registry pull needs credentials and abstraction.download requests are anonymous"})
 	}
-
-	source := opts.n.BaseURL().JoinPath("v2", opts.n.DisplayNamespaceModel(), "blobs", digest)
-	if opts.regOpts != nil && opts.regOpts.Insecure {
-		source.Scheme = "http" // as makeRequest does for upstream requests
-	}
-	payload := request.Encode(&request.Request{
-		Artifact: request.Artifact{Digest: digest, Size: size},
-		Sources:  []request.Source{{Scheme: source.Scheme, Locator: source.String()}},
-	})
 
 	dir, err := oaRequestsDir()
 	if err != nil {
@@ -222,44 +242,56 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 		return false, err
 	}
 
-	jobs, err := oaMachine().ResolveJobOperations(ctx, oaclient.Requirements{Guarantees: acceptance.AdmissionGuarantees, Scope: "local"})
-	if err != nil {
-		return fail(oaReasonUnavailable, "job service did not resolve", err)
-	}
-
-	if record == nil || record.Endpoint == "" {
-		attempt := 0
-		if record != nil {
-			attempt = record.Attempt
+	var jobs *oaclient.JobsClient
+	if record == nil {
+		source := opts.n.BaseURL().JoinPath("v2", opts.n.DisplayNamespaceModel(), "blobs", digest)
+		if opts.regOpts != nil && opts.regOpts.Insecure {
+			source.Scheme = "http" // as makeRequest does for upstream requests
+		}
+		jobs, err = oaMachine().ResolveJobOperations(ctx, oaclient.Requirements{Guarantees: acceptance.AdmissionGuarantees, Scope: "local"})
+		if err != nil {
+			return fail(oaBindError("job service did not resolve", err))
 		}
 		window, err := jobs.GetHistoryWindow(ctx)
 		if err != nil {
-			return fail(oaReasonUnavailable, "history window", err)
+			return fail(oaBindError("history window", err))
 		}
 		record = &oaRecord{
-			Format: oaRecordFormat, Digest: digest, Attempt: attempt,
-			Endpoint: jobs.Endpoint(), LogicalOwner: window.LogicalOwner,
-			Key: oaKey(digest, attempt), HistoryEpoch: window.HistoryEpoch,
-			Kind: "download", Request: payload, Guarantees: acceptance.AdmissionGuarantees,
+			Format: oaRecordFormat, Digest: digest, Binding: jobs.Binding(),
+			Identity: acceptance.RequestIdentity{Key: oaKey(digest), HistoryEpoch: window.HistoryEpoch},
+			Kind:     "download",
+			Request: request.Encode(&request.Request{
+				Artifact: request.Artifact{Digest: digest, Size: size},
+				Sources:  []request.Source{{Scheme: source.Scheme, Locator: source.String()}},
+			}),
 		}
-		if err := oaSaveRecord(recordPath, record); err != nil {
-			return false, err
+	} else {
+		// A restart restores the saved selection and authenticates it again.
+		jobs, err = oaMachine().RestoreJobs(ctx, record.Binding)
+		if err != nil {
+			return fail(oaBindError("restore saved job binding", err))
 		}
-	} else if record.Endpoint != jobs.Endpoint() {
-		return fail(oaReasonProviderChanged, fmt.Sprintf("request was accepted by %s and the resolver selected %s", record.Endpoint, jobs.Endpoint()), nil)
+		if record.Terminal {
+			record.Identity.Attempt++
+			record.OperationID, record.Terminal = "", false
+		}
+	}
+	if err := oaSaveRecord(recordPath, record); err != nil {
+		return false, err
 	}
 
-	id := record.identity()
+	id := record.Identity
 	accepted, err := oaAdmit(ctx, jobs, record)
 	if err != nil {
 		var typed *OAError
-		if errors.As(err, &typed) {
-			typed.Digest = digest
+		if errors.As(err, &typed) && typed.Reason == oaReasonRefused && strings.HasPrefix(typed.Detail, "definitely_not_accepted") {
+			// A sealed attempt is terminal; the next pull presents the next attempt.
+			record.Terminal = true
+			if saveErr := oaSaveRecord(recordPath, record); saveErr != nil {
+				return false, saveErr
+			}
 		}
-		return false, err
-	}
-	if accepted.Receipt.LogicalOwner != record.LogicalOwner {
-		return fail(oaReasonProviderChanged, "logical owner changed", nil)
+		return fail(err)
 	}
 	if record.OperationID != accepted.Receipt.OperationId {
 		record.OperationID = accepted.Receipt.OperationId
@@ -277,10 +309,10 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 				// A caller disconnect stops waiting only; accepted work continues.
 				return false, ctx.Err()
 			}
-			return fail(oaReasonUnknown, "observe work", err)
+			return fail(&OAError{Reason: oaReasonUnknown, Detail: "observe work", Err: err})
 		}
 		if observed.Outcome != "observed" {
-			return fail(oaReasonUnknown, "observe work outcome "+observed.Outcome, nil)
+			return fail(&OAError{Reason: oaReasonUnknown, Detail: "observe work outcome " + observed.Outcome})
 		}
 		s := observed.Snapshot
 		total := s.Progress.Total
@@ -288,15 +320,16 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 			total = size
 		}
 		current := status
-		if s.Failure != nil && s.State != "failed" {
-			// Nonterminal failure: the service retries. Show it; stop only on permanent.
-			if s.Failure.Classification == "permanent" {
-				return fail(oaReasonFailed, "permanent: "+s.Failure.Message, nil)
+		if s.Failure != nil && s.Failure.Classification == "retryable" {
+			// The service tries this operation again; show why it is waiting.
+			reason := s.Failure.Cause
+			if reason == "" {
+				reason = s.Failure.Message
 			}
-			current = fmt.Sprintf("%s (OA service retrying: %s)", status, s.Failure.Message)
-			if s.Failure.Message != lastFailure {
-				slog.Warn("OA download retrying", "digest", digest, "state", s.State, "classification", s.Failure.Classification, "message", s.Failure.Message)
-				lastFailure = s.Failure.Message
+			current = fmt.Sprintf("%s (OA service retrying: %s)", status, reason)
+			if reason != lastFailure {
+				slog.Warn("OA download retrying", "digest", digest, "state", s.State, "cause", s.Failure.Cause, "message", s.Failure.Message)
+				lastFailure = reason
 			}
 		}
 		opts.fn(api.ProgressResponse{Status: current, Digest: digest, Total: total, Completed: s.Progress.Done})
@@ -304,15 +337,11 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 			break
 		}
 		if s.State == "failed" || s.State == "cancelled" {
-			detail := s.State
-			if s.Failure != nil {
-				detail += " (" + s.Failure.Classification + "): " + s.Failure.Message
-			}
-			// The next pull submits a new attempt; this identity is terminal.
-			if err := oaNextAttempt(recordPath, record); err != nil {
+			record.Terminal = true
+			if err := oaSaveRecord(recordPath, record); err != nil {
 				return false, err
 			}
-			return fail(oaReasonFailed, detail, nil)
+			return fail(oaFailure(s))
 		}
 		select {
 		case <-ctx.Done():
@@ -330,16 +359,14 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 		}
 		var service *acceptance.ServiceError
 		if errors.As(err, &service) && service.Code != "invalid_result" {
-			if saveErr := oaNextAttempt(recordPath, record); saveErr != nil {
-				return false, saveErr
-			}
-			return fail(oaReasonResultUnavailable, "", err)
+			// Complete work whose bytes are gone is not retryable under JOB-A7.
+			return fail(&OAError{Reason: oaReasonResultUnavailable, Err: err})
 		}
 		return false, err
 	}
 	if got := "sha256:" + sum; got != digest || (size > 0 && written != size) {
 		os.Remove(tmpPath)
-		return fail(oaReasonDigestMismatch, fmt.Sprintf("delivered %s, %d bytes", got, written), errDigestMismatch)
+		return fail(&OAError{Reason: oaReasonDigestMismatch, Detail: fmt.Sprintf("delivered %s, %d bytes", got, written), Err: errDigestMismatch})
 	}
 	if err := os.Rename(tmpPath, fp); err != nil {
 		os.Remove(tmpPath)
@@ -355,8 +382,13 @@ func oaDownloadBlob(ctx context.Context, size int64, opts downloadOpts) (bool, e
 
 // oaAdmit reconciles a persisted identity or submits it. It never cancels work.
 func oaAdmit(ctx context.Context, jobs *oaclient.JobsClient, record *oaRecord) (acceptance.AcceptanceResult, error) {
-	id := record.identity()
-	refused := func(reason string, result acceptance.AcceptanceResult) error {
+	id := record.Identity
+	refused := func(result acceptance.AcceptanceResult) error {
+		reason := oaReasonRefused
+		if result.Outcome == "unavailable" {
+			// No effect and no seal: the same identity is presented next time [JOB-A9].
+			reason = oaReasonUnavailable
+		}
 		return &OAError{Reason: reason, Detail: result.Outcome + ": " + result.Reason}
 	}
 	if record.OperationID != "" {
@@ -364,16 +396,12 @@ func oaAdmit(ctx context.Context, jobs *oaclient.JobsClient, record *oaRecord) (
 		if err != nil {
 			return result, &OAError{Reason: oaReasonUnknown, Detail: "reconcile", Err: err}
 		}
-		switch result.Outcome {
-		case "accepted":
+		if result.Outcome == "accepted" {
 			return result, nil
-		case "definitely_not_accepted":
-			// Fall through to submission of the identical persisted request.
-		default:
-			return result, refused(oaReasonRefused, result)
 		}
+		return result, refused(result)
 	}
-	submission := acceptance.Submission{Identity: id, Kind: record.Kind, Spec: record.Request, RequiredGuarantees: record.Guarantees}
+	submission := acceptance.Submission{Identity: id, Kind: record.Kind, Spec: record.Request, RequiredGuarantees: record.Binding.RequiredGuarantees}
 	result, err := jobs.Submit(ctx, submission)
 	if err != nil {
 		// Acceptance is unresolved; the retained record reconciles next time.
@@ -392,9 +420,9 @@ func oaAdmit(ctx context.Context, jobs *oaclient.JobsClient, record *oaRecord) (
 		if reconciled.Outcome == "accepted" {
 			return reconciled, nil
 		}
-		return reconciled, refused(oaReasonRefused, reconciled)
+		return reconciled, refused(reconciled)
 	default:
-		return result, refused(oaReasonRefused, result)
+		return result, refused(result)
 	}
 }
 
@@ -421,5 +449,3 @@ func oaCopy(ctx context.Context, jobs *oaclient.JobsClient, id acceptance.Reques
 	}
 	return written, hex.EncodeToString(w.h.Sum(nil)), err
 }
-
-var _ io.Writer = oaHashingFile{}

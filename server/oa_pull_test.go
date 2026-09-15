@@ -45,6 +45,7 @@ type oaRegistry struct {
 	startOnce   sync.Once
 	release     chan struct{} // nil serves immediately
 	corrupt     atomic.Bool
+	missing     atomic.Bool
 }
 
 func newOARegistry(t *testing.T) *oaRegistry {
@@ -89,6 +90,10 @@ func (r *oaRegistry) serve(w http.ResponseWriter, req *http.Request) {
 			r.blobHeads.Add(1)
 		}
 		body := r.config
+		if strings.HasSuffix(req.URL.Path, r.layerDigest) && r.missing.Load() {
+			http.NotFound(w, req)
+			return
+		}
 		if strings.HasSuffix(req.URL.Path, r.layerDigest) {
 			body = r.layer
 			if req.Method == http.MethodGet {
@@ -348,33 +353,79 @@ func TestOAPullCredentialsRefused(t *testing.T) {
 	assertNoBlob(t, r.layerDigest)
 }
 
-// The service verifies the digest and keeps retrying a mismatching source.
-// The pull shows that retry, never commits the bytes, and a later pull against
-// a sound source reconciles the same operation to a verified blob.
-func TestOAPullCorruptSourceNeverCommits(t *testing.T) {
+// A digest mismatch ends the operation with a typed cause [JOB-A8]. Nothing is
+// committed, and the next pull retries as attempt 1 of the same key [JOB-A7].
+func TestOAPullCorruptSourceFailsTypedThenRetriesAttempt(t *testing.T) {
 	home := setupOA(t)
 	t.Setenv(oaDownloadEnv, "service")
 	r := newOARegistry(t)
 	r.corrupt.Store(true)
-	oaService(t, home, true)
+	f := oaService(t, home, true)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
-	defer cancel()
-	var retrying atomic.Bool
-	err := pullOA(ctx, r, nil, func(p api.ProgressResponse) {
-		// The observation carries a generic failure message, not the cause.
-		if strings.Contains(p.Status, "OA service retrying") {
-			retrying.Store(true)
-		}
-	})
-	if !errors.Is(err, context.DeadlineExceeded) || !retrying.Load() {
-		t.Fatalf("corrupt source: err %v, retry shown %v", err, retrying.Load())
+	err := pullOA(t.Context(), r, nil, nil)
+	typed := oaReason(t, err, oaReasonDigestMismatch)
+	if typed.Cause != "digest_mismatch" || !errors.Is(err, errDigestMismatch) {
+		t.Fatalf("corrupt source: %+v", typed)
 	}
 	assertNoBlob(t, r.layerDigest)
+	dir, _ := oaRequestsDir()
+	record, err := oaLoadRecord(oaRecordPath(dir, r.layerDigest))
+	if err != nil || record == nil || !record.Terminal || record.Identity.Attempt != 0 {
+		t.Fatalf("terminal record: %+v %v", record, err)
+	}
 
 	r.corrupt.Store(false)
 	pullOK(t, r)
 	assertBlob(t, r.layerDigest, r.layer)
+	if n := len(f.operations(t)); n != 3 {
+		t.Fatalf("operations: %d (want failed attempt 0, attempt 1, config)", n)
+	}
+}
+
+// A blob the registry does not have ends typed as not_found, with no retry loop.
+func TestOAPullMissingBlobIsTyped(t *testing.T) {
+	home := setupOA(t)
+	t.Setenv(oaDownloadEnv, "service")
+	r := newOARegistry(t)
+	r.missing.Store(true)
+	oaService(t, home, true)
+	typed := oaReason(t, pullOA(t.Context(), r, nil, nil), oaReasonNotFound)
+	if typed.Cause != "not_found" {
+		t.Fatalf("missing blob: %+v", typed)
+	}
+	assertNoBlob(t, r.layerDigest)
+}
+
+// Restoring a saved binding against a service with another logical owner is
+// refused, so accepted work is never silently resubmitted elsewhere.
+func TestOAPullRestoreRefusesDifferentOwner(t *testing.T) {
+	home := setupOA(t)
+	t.Setenv(oaDownloadEnv, "service")
+	r := newOARegistry(t)
+	r.release = make(chan struct{})
+	f := oaService(t, home, true)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	first := make(chan error, 1)
+	go func() { first <- pullOA(ctx, r, nil, nil) }()
+	select {
+	case <-r.started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("service never started the transfer")
+	}
+	cancel()
+	<-first
+	f.stop()
+	close(r.release)
+	f.options.JobRoot = filepath.Join(home, "other-private")
+	f.options.JobOwner = "another-owner"
+	f.start(t)
+
+	oaReason(t, pullOA(t.Context(), r, nil, nil), oaReasonProviderChanged)
+	assertNoBlob(t, r.layerDigest)
+	if n := len(f.operations(t)); n != 0 {
+		t.Fatalf("work resubmitted to another owner: %d", n)
+	}
 }
 
 // An interrupted pull followed by a new pull, as after an Ollama restart,

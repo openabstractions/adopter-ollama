@@ -1,0 +1,26 @@
+// Test-only workspace: builds this fork against unpublished OpenAbstractions
+// sources in the surrounding monorepo checkout (.forks/adopter-ollama).
+//
+//   GOWORK=$PWD/oa-local.go.work go test ./server/ -run TestOAPull
+//
+// go.mod keeps published OpenAbstractions versions. Remove this file once the
+// required OA modules are tagged and go.mod requires them.
+go 1.26.0
+
+use (
+	.
+	../../openabstractions-flat/abstraction-asks/go
+	../../openabstractions-flat/abstraction-cas/go
+	../../openabstractions-flat/abstraction-config/go
+	../../openabstractions-flat/abstraction-download/go
+	../../openabstractions-flat/abstraction-facade/go
+	../../openabstractions-flat/abstraction-facade/go-core
+	../../openabstractions-flat/abstraction-identity
+	../../openabstractions-flat/abstraction-job/go
+	../../openabstractions-flat/abstraction-logging/go
+	../../openabstractions-flat/abstraction-model/go
+	../../openabstractions-flat/abstraction-rights/go
+	../../openabstractions-flat/abstraction-router/go
+	../../openabstractions-flat/abstraction-storage/go
+	../../openabstractions-flat/abstraction-watch/go
+)
